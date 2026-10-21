@@ -26,7 +26,6 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.LinearProgressIndicator
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
@@ -45,7 +44,7 @@ import kotlinx.coroutines.flow.collectLatest
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun LibraryScreen(
-    onNavigateToReader: () -> Unit,
+    onNavigateToReader: (Long) -> Unit,
     modifier: Modifier = Modifier,
     viewModel: LibraryViewModel = viewModel()
 ) {
@@ -110,10 +109,6 @@ fun LibraryScreen(
                     Button(onClick = ::openPicker) {
                         Text("Import EPUB")
                     }
-                    Spacer(modifier = Modifier.height(8.dp))
-                    OutlinedButton(onClick = onNavigateToReader) {
-                        Text("Open Reader (Temporary)")
-                    }
                 }
             }
         } else {
@@ -138,7 +133,7 @@ fun LibraryScreen(
                 ) { book ->
                     BookItem(
                         book = book,
-                        onClick = onNavigateToReader
+                        onClick = { onNavigateToReader(book.id) }
                     )
                 }
             }

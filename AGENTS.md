@@ -39,4 +39,4 @@ in the version catalog. Never guess method names. If unsure, say so.
 - util/     small helpers
 
 ## Current status
-Milestone 2: import EPUBs and library view completed.
+Milestone 3: open EPUB in reader completed.
