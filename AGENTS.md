@@ -39,4 +39,4 @@ in the version catalog. Never guess method names. If unsure, say so.
 - util/     small helpers
 
 ## Current status
-Milestone 1: app skeleton completed.
+Milestone 2: import EPUBs and library view completed.
