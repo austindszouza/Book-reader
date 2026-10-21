@@ -40,3 +40,8 @@ in the version catalog. Never guess method names. If unsure, say so.
 
 ## Current status
 Milestone 3: open EPUB in reader completed.
+
+## Plan deviations
+If you need to deviate from an approved plan (different library, different
+architecture, extra UI, extra scope), stop and tell me first with the reason.
+Don't implement the change and explain it afterward.
