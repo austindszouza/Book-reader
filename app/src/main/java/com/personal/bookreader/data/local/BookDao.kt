@@ -19,4 +19,7 @@ interface BookDao {
 
     @Insert(onConflict = OnConflictStrategy.ABORT)
     suspend fun insert(book: BookEntity): Long
+
+    @Query("UPDATE books SET progression = :progression, locatorJson = :locatorJson WHERE id = :id")
+    suspend fun updateProgress(id: Long, progression: Double?, locatorJson: String?)
 }

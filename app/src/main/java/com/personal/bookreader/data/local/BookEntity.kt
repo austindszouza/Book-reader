@@ -16,5 +16,7 @@ data class BookEntity(
     val filePath: String,
     val coverPath: String?,
     val fileHash: String,
-    val dateAdded: Long = System.currentTimeMillis()
+    val dateAdded: Long = System.currentTimeMillis(),
+    val progression: Double? = null,
+    val locatorJson: String? = null
 )

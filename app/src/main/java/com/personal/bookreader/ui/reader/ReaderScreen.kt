@@ -22,8 +22,12 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -34,6 +38,9 @@ import androidx.core.view.doOnAttach
 import androidx.fragment.app.FragmentActivity
 import androidx.fragment.app.FragmentContainerView
 import androidx.fragment.app.commit
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.personal.bookreader.R
 import org.readium.r2.navigator.epub.EpubNavigatorFragment
@@ -50,6 +57,30 @@ fun ReaderScreen(
     val uiState by viewModel.uiState.collectAsState()
     val context = LocalContext.current
     val activity = context as? FragmentActivity
+    val lifecycleOwner = LocalLifecycleOwner.current
+
+    var navigatorFragment by remember { mutableStateOf<EpubNavigatorFragment?>(null) }
+
+    // Observe page turns and position updates from Readium's currentLocator StateFlow
+    LaunchedEffect(navigatorFragment) {
+        navigatorFragment?.currentLocator?.collect { locator ->
+            viewModel.onLocatorChanged(locator)
+        }
+    }
+
+    // Immediately flush reading progress when pausing, stopping, or exiting
+    DisposableEffect(lifecycleOwner, viewModel) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_PAUSE || event == Lifecycle.Event.ON_STOP) {
+                viewModel.saveProgressImmediately()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+            viewModel.saveProgressImmediately()
+        }
+    }
 
     BackHandler {
         onBackClick()
@@ -57,6 +88,7 @@ fun ReaderScreen(
 
     DisposableEffect(viewModel.bookId) {
         onDispose {
+            navigatorFragment = null
             activity?.supportFragmentManager?.let { fm ->
                 if (!fm.isStateSaved && !fm.isDestroyed) {
                     val fragment = fm.findFragmentById(R.id.epub_navigator_container)
@@ -157,8 +189,11 @@ fun ReaderScreen(
                                         val existing = fm.findFragmentById(R.id.epub_navigator_container)
                                         if (existing is EpubNavigatorFragment && !existing.isRemoving) {
                                             existing.addInputListener(DirectionalNavigationAdapter(existing))
+                                            navigatorFragment = existing
                                         } else {
-                                            val factory = state.navigatorFactory.createFragmentFactory(initialLocator = null)
+                                            val factory = state.navigatorFactory.createFragmentFactory(
+                                                initialLocator = state.initialLocator
+                                            )
                                             fm.fragmentFactory = factory
                                             val fragment = factory.instantiate(
                                                 container.context.classLoader,
@@ -166,9 +201,14 @@ fun ReaderScreen(
                                             ) as EpubNavigatorFragment
 
                                             fragment.addInputListener(DirectionalNavigationAdapter(fragment))
+                                            navigatorFragment = fragment
 
                                             fm.commit {
-                                                replace(R.id.epub_navigator_container, fragment, "epub_navigator_${viewModel.bookId}")
+                                                replace(
+                                                    R.id.epub_navigator_container,
+                                                    fragment,
+                                                    "epub_navigator_${viewModel.bookId}"
+                                                )
                                             }
                                         }
                                     }

@@ -39,7 +39,7 @@ in the version catalog. Never guess method names. If unsure, say so.
 - util/     small helpers
 
 ## Current status
-Milestone 3: open EPUB in reader completed.
+Milestone 4: remember reading progress completed.
 
 ## Plan deviations
 If you need to deviate from an approved plan (different library, different

@@ -8,15 +8,24 @@ import com.personal.bookreader.data.local.AppDatabase
 import com.personal.bookreader.data.repository.BookRepository
 import java.io.File
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.launch
+import org.json.JSONObject
 import org.readium.r2.navigator.epub.EpubNavigatorFactory
 import org.readium.r2.shared.ExperimentalReadiumApi
+import org.readium.r2.shared.publication.Locator
 import org.readium.r2.shared.publication.Publication
 import org.readium.r2.shared.util.asset.Asset
 import org.readium.r2.shared.util.asset.AssetRetriever
@@ -29,12 +38,13 @@ sealed interface ReaderUiState {
     data object Loading : ReaderUiState
     data class Success(
         val title: String,
-        val navigatorFactory: EpubNavigatorFactory
+        val navigatorFactory: EpubNavigatorFactory,
+        val initialLocator: Locator?
     ) : ReaderUiState
     data class Error(val message: String) : ReaderUiState
 }
 
-@OptIn(ExperimentalReadiumApi::class)
+@OptIn(ExperimentalReadiumApi::class, FlowPreview::class)
 class ReaderViewModel(
     application: Application,
     savedStateHandle: SavedStateHandle
@@ -47,13 +57,59 @@ class ReaderViewModel(
     private var activePublication: Publication? = null
     private var activeAsset: Asset? = null
 
+    private val saveScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var lastSavedLocator: Locator? = null
+    private var currentLocator: Locator? = null
+    private val locatorUpdates = MutableSharedFlow<Locator>(
+        replay = 0,
+        extraBufferCapacity = 1,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+
     private val _uiState = MutableStateFlow<ReaderUiState>(ReaderUiState.Loading)
     val uiState: StateFlow<ReaderUiState> = _uiState.asStateFlow()
 
     init {
         val database = AppDatabase.getDatabase(application)
         repository = BookRepository(database.bookDao())
+
+        // Debounce locator persistence so rapid page turns don't trigger database writes on every frame
+        viewModelScope.launch(Dispatchers.IO) {
+            locatorUpdates
+                .debounce(1000L)
+                .collectLatest { locator ->
+                    saveLocator(locator)
+                }
+        }
+
         loadBook()
+    }
+
+    fun onLocatorChanged(locator: Locator) {
+        currentLocator = locator
+        locatorUpdates.tryEmit(locator)
+    }
+
+    fun saveProgressImmediately() {
+        val locator = currentLocator ?: return
+        saveScope.launch {
+            saveLocator(locator)
+        }
+    }
+
+    private suspend fun saveLocator(locator: Locator) {
+        // Skip database writes if the locator is unchanged since the last save
+        if (locator == lastSavedLocator) {
+            return
+        }
+
+        val rawProgression = locator.locations.totalProgression
+        // Treat totalProgression >= 0.99 as finished (100%). If null, store null.
+        val progression = if (rawProgression != null && rawProgression >= 0.99) 1.0 else rawProgression
+        val locatorJson = locator.toJSON().toString()
+
+        repository.updateProgress(bookId, progression, locatorJson)
+        lastSavedLocator = locator
     }
 
     fun loadBook() {
@@ -70,8 +126,7 @@ class ReaderViewModel(
             var publication: Publication? = null
 
             try {
-                val book = repository.allBooks // or dao
-                val bookEntity = AppDatabase.getDatabase(getApplication()).bookDao().getBookById(bookId)
+                val bookEntity = repository.getBookById(bookId)
                 if (bookEntity == null) {
                     _uiState.value = ReaderUiState.Error("Book not found in library.")
                     return@launch
@@ -86,6 +141,17 @@ class ReaderViewModel(
                 }
 
                 ensureActive()
+
+                // Restore saved locator if available; corrupt or incompatible JSON falls back to null (start of book)
+                val initialLocator = bookEntity.locatorJson?.let { json ->
+                    try {
+                        Locator.fromJSON(JSONObject(json))
+                    } catch (e: Exception) {
+                        null
+                    }
+                }
+                lastSavedLocator = initialLocator
+                currentLocator = initialLocator
 
                 val assetRetriever = AssetRetriever(
                     getApplication<Application>().contentResolver,
@@ -112,7 +178,6 @@ class ReaderViewModel(
 
                 ensureActive()
 
-                // Successfully opened and verified active
                 activeAsset = asset
                 activePublication = publication
 
@@ -120,10 +185,10 @@ class ReaderViewModel(
 
                 _uiState.value = ReaderUiState.Success(
                     title = bookEntity.title,
-                    navigatorFactory = navigatorFactory
+                    navigatorFactory = navigatorFactory,
+                    initialLocator = initialLocator
                 )
             } catch (e: CancellationException) {
-                // If cancelled while opening, immediately close opened resources
                 publication?.close()
                 asset?.close()
                 throw e
@@ -137,6 +202,7 @@ class ReaderViewModel(
 
     override fun onCleared() {
         super.onCleared()
+        saveProgressImmediately()
         openJob?.cancel()
         activePublication?.close()
         activeAsset?.close()
