@@ -6,6 +6,8 @@ import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.viewModelScope
 import com.personal.bookreader.data.local.AppDatabase
 import com.personal.bookreader.data.repository.BookRepository
+import com.personal.bookreader.data.settings.ReaderPreferencesRepository
+import com.personal.bookreader.data.settings.ReaderSettings
 import java.io.File
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -17,13 +19,21 @@ import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import org.readium.r2.navigator.epub.EpubNavigatorFactory
+import org.readium.r2.navigator.epub.EpubPreferences
+import org.readium.r2.navigator.preferences.FontFamily
+import org.readium.r2.navigator.preferences.Theme
 import org.readium.r2.shared.ExperimentalReadiumApi
 import org.readium.r2.shared.publication.Locator
 import org.readium.r2.shared.publication.Publication
@@ -39,7 +49,8 @@ sealed interface ReaderUiState {
     data class Success(
         val title: String,
         val navigatorFactory: EpubNavigatorFactory,
-        val initialLocator: Locator?
+        val initialLocator: Locator?,
+        val initialPreferences: EpubPreferences
     ) : ReaderUiState
     data class Error(val message: String) : ReaderUiState
 }
@@ -53,6 +64,17 @@ class ReaderViewModel(
     val bookId: Long = savedStateHandle.get<Long>("bookId") ?: -1L
 
     private val repository: BookRepository
+    private val preferencesRepository: ReaderPreferencesRepository
+
+    val settings: StateFlow<ReaderSettings>
+
+    private val _livePreferences = MutableSharedFlow<EpubPreferences>(
+        replay = 0,
+        extraBufferCapacity = 1,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
+    val livePreferences: SharedFlow<EpubPreferences> = _livePreferences.asSharedFlow()
+
     private var openJob: Job? = null
     private var activePublication: Publication? = null
     private var activeAsset: Asset? = null
@@ -72,17 +94,78 @@ class ReaderViewModel(
     init {
         val database = AppDatabase.getDatabase(application)
         repository = BookRepository(database.bookDao())
+        preferencesRepository = ReaderPreferencesRepository.getInstance(application)
+
+        settings = preferencesRepository.settings.stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.Eagerly,
+            initialValue = ReaderSettings()
+        )
+
+        // Whenever DataStore emits updated settings, push them to live preferences
+        viewModelScope.launch {
+            preferencesRepository.settings.collect { currentSettings ->
+                _livePreferences.tryEmit(toEpubPreferences(currentSettings))
+            }
+        }
 
         // Debounce locator persistence so rapid page turns don't trigger database writes on every frame
         viewModelScope.launch(Dispatchers.IO) {
             locatorUpdates
                 .debounce(1000L)
                 .collectLatest { locator ->
-                    saveLocator(locator)
+                    saveLocator(locator, "debounce")
                 }
         }
 
         loadBook()
+    }
+
+    fun toEpubPreferences(readerSettings: ReaderSettings): EpubPreferences {
+        val isCustomSpacingOrFont = (readerSettings.lineHeight != null) || (readerSettings.fontFamily != null)
+        val font = readerSettings.fontFamily?.let { FontFamily(it) }
+
+        return EpubPreferences(
+            theme = readerSettings.theme,
+            fontSize = readerSettings.fontSize,
+            lineHeight = readerSettings.lineHeight,
+            fontFamily = font,
+            publisherStyles = if (isCustomSpacingOrFont) false else null
+        )
+    }
+
+    fun updateTheme(theme: Theme) {
+        viewModelScope.launch {
+            preferencesRepository.updateTheme(theme)
+        }
+    }
+
+    fun updateFontFamily(fontFamily: String?) {
+        viewModelScope.launch {
+            preferencesRepository.updateFontFamily(fontFamily)
+        }
+    }
+
+    fun updateLineHeight(lineHeight: Double?) {
+        viewModelScope.launch {
+            preferencesRepository.updateLineHeight(lineHeight)
+        }
+    }
+
+    fun commitFontSize(fontSize: Double) {
+        viewModelScope.launch {
+            preferencesRepository.updateFontSize(fontSize)
+        }
+    }
+
+    fun applyFontSizeLive(currentSettings: ReaderSettings, liveSize: Double) {
+        val liveSettings = currentSettings.copy(fontSize = liveSize)
+        _livePreferences.tryEmit(toEpubPreferences(liveSettings))
+    }
+
+    fun applyLineHeightLive(currentSettings: ReaderSettings, liveLineHeight: Double?) {
+        val liveSettings = currentSettings.copy(lineHeight = liveLineHeight)
+        _livePreferences.tryEmit(toEpubPreferences(liveSettings))
     }
 
     fun onLocatorChanged(locator: Locator) {
@@ -90,21 +173,31 @@ class ReaderViewModel(
         locatorUpdates.tryEmit(locator)
     }
 
-    fun saveProgressImmediately() {
-        val locator = currentLocator ?: return
+    fun saveProgressImmediately(source: String = "manual", freshLocator: Locator? = null) {
+        var locator = freshLocator ?: currentLocator
+        if (locator == null) return
+
+        if (freshLocator != null && freshLocator.locations.totalProgression == null) {
+            val totalProg = currentLocator?.locations?.totalProgression
+            if (totalProg != null) {
+                locator = locator.copy(
+                    locations = locator.locations.copy(totalProgression = totalProg)
+                )
+            }
+        }
+
+        currentLocator = locator
         saveScope.launch {
-            saveLocator(locator)
+            saveLocator(locator, source)
         }
     }
 
-    private suspend fun saveLocator(locator: Locator) {
-        // Skip database writes if the locator is unchanged since the last save
+    private suspend fun saveLocator(locator: Locator, source: String) {
         if (locator == lastSavedLocator) {
             return
         }
 
         val rawProgression = locator.locations.totalProgression
-        // Treat totalProgression >= 0.99 as finished (100%). If null, store null.
         val progression = if (rawProgression != null && rawProgression >= 0.99) 1.0 else rawProgression
         val locatorJson = locator.toJSON().toString()
 
@@ -142,7 +235,6 @@ class ReaderViewModel(
 
                 ensureActive()
 
-                // Restore saved locator if available; corrupt or incompatible JSON falls back to null (start of book)
                 val initialLocator = bookEntity.locatorJson?.let { json ->
                     try {
                         Locator.fromJSON(JSONObject(json))
@@ -152,6 +244,10 @@ class ReaderViewModel(
                 }
                 lastSavedLocator = initialLocator
                 currentLocator = initialLocator
+
+                // Load saved preferences before creating the navigator factory to avoid theme flashing
+                val initialSettings = preferencesRepository.settings.first()
+                val initialPreferences = toEpubPreferences(initialSettings)
 
                 val assetRetriever = AssetRetriever(
                     getApplication<Application>().contentResolver,
@@ -178,6 +274,17 @@ class ReaderViewModel(
 
                 ensureActive()
 
+                var validatedLocator = initialLocator
+                if (validatedLocator != null) {
+                    val link = publication.linkWithHref(validatedLocator.href)
+                    if (link == null) {
+                        validatedLocator = null
+                        repository.updateProgress(bookId, null, null)
+                    }
+                }
+                lastSavedLocator = validatedLocator
+                currentLocator = validatedLocator
+
                 activeAsset = asset
                 activePublication = publication
 
@@ -186,7 +293,8 @@ class ReaderViewModel(
                 _uiState.value = ReaderUiState.Success(
                     title = bookEntity.title,
                     navigatorFactory = navigatorFactory,
-                    initialLocator = initialLocator
+                    initialLocator = validatedLocator,
+                    initialPreferences = initialPreferences
                 )
             } catch (e: CancellationException) {
                 publication?.close()
@@ -202,7 +310,7 @@ class ReaderViewModel(
 
     override fun onCleared() {
         super.onCleared()
-        saveProgressImmediately()
+        saveProgressImmediately("onCleared")
         openJob?.cancel()
         activePublication?.close()
         activeAsset?.close()

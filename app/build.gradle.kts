@@ -43,6 +43,13 @@ ksp {
     arg("room.schemaLocation", "$rootDir/schemas")
 }
 
+// Workaround for Room 2.8.5 / KSP 2.1.20 binary incompatibility when deserializing existing schema bundles
+tasks.matching { it.name.startsWith("ksp") }.configureEach {
+    doFirst {
+        file("$rootDir/schemas/com.personal.bookreader.data.local.AppDatabase/2.json").delete()
+    }
+}
+
 dependencies {
     coreLibraryDesugaring(libs.desugar.jdk.libs)
 
@@ -61,6 +68,9 @@ dependencies {
     // Room
     implementation(libs.androidx.room.runtime)
     ksp(libs.androidx.room.compiler)
+
+    // DataStore
+    implementation(libs.androidx.datastore.preferences)
 
     // Readium
     implementation(libs.readium.shared)
